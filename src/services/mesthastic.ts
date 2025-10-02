@@ -1,29 +1,50 @@
-import * as mqtt from 'mqtt';
-import { nodes, nodesCreateSchema } from '../models'
-import { db } from '../database';
-import z from 'zod';
-import { isJSON } from '../utils/json';
 import { ORPCError } from '@orpc/client';
+import * as mqtt from 'mqtt';
+import path from 'path';
+import protobufjs from 'protobufjs';
+import z from 'zod';
+import { db } from '../database';
+import { nodes } from '../models';
+import { DrizzleUpsertData, NodeUpdate, transformPositionToNodeUpdate, transformUserToNodeUpdate } from '../utils/meshtastic';
 
 const BROKER_URL = 'mqtts://mqtt.meshtastic.org';
-// Suscripción universal para NodeInfo (todos los nodos) y Posición
-const UNIVERSAL_TOPICS = [
-    'msh/+/2/json/#/nodeinfo',
-    'msh/+/2/json/#/position'
-];
+const UNIVERSAL_PROTOBUF_TOPIC = 'msh/+/2/e/#';
+
+// load protobufs
+const root = new protobufjs.Root();
+root.resolvePath = (_, target) => path.join(path.join(process.cwd(), "src/proto"), target);
+root.loadSync('meshtastic/mqtt.proto');
+const Data = root.lookupType("Data");
+const ServiceEnvelope = root.lookupType("ServiceEnvelope");
+const MapReport = root.lookupType("MapReport");
+const NeighborInfo = root.lookupType("NeighborInfo");
+const Position = root.lookupType("Position");
+const RouteDiscovery = root.lookupType("RouteDiscovery");
+const Telemetry = root.lookupType("Telemetry");
+const User = root.lookupType("User");
+const Waypoint = root.lookupType("Waypoint");
+
+// Define the map outside the function
+const PayloadTypeMap: { [key: string]: protobufjs.Type } = {
+    'POSITION_APP': Position,
+    'TELEMETRY_APP': Telemetry,
+    'NODEINFO_APP': User,
+    // Add others as you encounter them
+    // 'WAYPOINT_APP': Waypoint,
+    // 'MAPREPORT_APP': MapReport,
+    // 'NEIGHBORINFO_APP': NeighborInfo,
+    // 'ROUTE_DISCOVERY_APP': RouteDiscovery,
+};
+
 
 export function startMqttClient() {
-    // Genera una ID de cliente única y aleatoria
     const clientId = 'mqtt_ingest_service_' + Math.random().toString(16).substr(2, 8);
-    // Configuración para la conexión anónima, forzando la ID
     const options: mqtt.IClientOptions = {
         clientId: clientId,
         username: "meshdev",
         password: "large4cats",
-        clean: true, // Iniciar una nueva sesión cada vez (no intentar reanudar)
-        // *** LÍNEA CLAVE PARA IGNORAR EL ERROR DE CERTIFICADO ***
+        clean: true,
         rejectUnauthorized: false,
-        // *** CAMBIO CRUCIAL: Forzar el uso del protocolo seguro/TLS ***
         protocol: 'mqtts',
     };
 
@@ -31,7 +52,7 @@ export function startMqttClient() {
 
     client.on('connect', () => {
         console.log(`Conectado al broker Meshtastic. Suscribiendo...`);
-        client.subscribe("msh/+/2/json/#", (err) => {
+        client.subscribe(UNIVERSAL_PROTOBUF_TOPIC, (err) => {
             if (err) console.error("Error al suscribirse:", err);
             else console.log("Subscripción a temas globales exitosa.");
         });
@@ -39,65 +60,91 @@ export function startMqttClient() {
 
     client.on('message', async (topic, message) => {
         try {
-            const jsonString = message.toString("utf-8");
-            if (isJSON(jsonString)) {
-                const data = JSON.parse(jsonString);
+            // 1. Decode the ServiceEnvelope from the MQTT buffer
+            const envelope = ServiceEnvelope.decode(message);
+            const decodedEnvelope = envelope.toJSON();
+            const packet = decodedEnvelope.packet;
 
-                // **VALIDACIÓN CRÍTICA**
-                if (!data.sender) {
-                    console.warn(`[PROCESS SKIP] Mensaje de ${topic} ignorado: 'sender' es nulo o indefinido.`);
-                    return; // Detiene el procesamiento si no hay remitente
-                }
+            // 2. Check for an encrypted payload (cannot be processed without the key)
+            if (packet?.encrypted) {
+                console.log(`[DATA SKIPPED] Packet is encrypted on channel ${decodedEnvelope.channelId}. Cannot decode payload without the channel key.`);
+                return; // Stop processing this packet
+            }
 
-                const nodeId = data.sender.replace('!', '');
-                const region = topic.split('/')[1];
-                const now = new Date();
+            // 3. Check for the string portnum and payload data
+            const portnumString = packet?.decoded?.portnum;
+            const payloadBase64 = packet?.decoded?.payload;
 
-                const messageType = data.type;
-                // 2. Filtrado y Procesamiento
-                if (messageType === 'position' || messageType === 'nodeinfo') {
+            if (portnumString && payloadBase64) {
+                const ProtoType = PayloadTypeMap[portnumString];
 
-                    let updateData: Partial<z.infer<typeof nodesCreateSchema>> = {
-                        lastSeen: now,
-                        region: region,
+                if (ProtoType) {
+                    // a. Convert Base64 string back to a Protobuf Buffer
+                    const payloadBuffer = Buffer.from(payloadBase64, 'base64');
+
+                    // b. Decode the inner payload using the correct Protobuf Type
+                    const innerPayload = ProtoType.decode(payloadBuffer);
+                    const decodedPayload = innerPayload.toJSON();
+
+                    const nodeId = packet.from;
+
+                    let updateData: DrizzleUpsertData = {
+                        id: nodeId.toString(16),
+                        lastSeen: new Date()
                     };
 
-                    // --- Lógica de Posición ---
-                    if (messageType === 'position' && data.payload.latitude && data.payload.longitude) {
-                        const lat = data.payload.latitude / 10000000;
-                        const lng = data.payload.longitude / 10000000;
+                    switch (portnumString) {
+                        case 'POSITION_APP':
+                            updateData = transformPositionToNodeUpdate(nodeId, decodedPayload);
+                            console.log("Saving POSITION_APP data:", updateData);
+                            break;
 
-                        // Prepara los datos de posición para la BD
-                        updateData.position = [Number(lat.toFixed(6)), Number(lng.toFixed(6))]
+                        case 'NODEINFO_APP':
+                            updateData = transformUserToNodeUpdate(nodeId, decodedPayload); 
+                            console.log("Saving NODEINFO_APP data:", updateData);
+                            break;
 
+                        case 'TELEMETRY_APP':
+                            // Telemetry usually goes into a separate `telemetry` table, 
+                            // but you still update `lastSeen` on the `nodes` table.
+                            console.log("Processed TELEMETRY_APP. Node update minimal.");
+                            break;
+
+                        default:
+                            // For any other type, just ensure 'id' and 'lastSeen' are set.
+                            console.log(`[HANDLER] Unhandled specific payload type: ${portnumString}. Minimal node update.`);
+                            break;
                     }
 
-                    // --- Lógica de NodeInfo (Información Estática) ---
-                    if (messageType === 'nodeinfo' && data.payload.longName) {
-                        const info = data.payload;
-                        updateData = {
-                            ...updateData,
-                            shortName: info.shortName || null,
-                            longName: info.longName || null,
-                            firmwareVersion: info.firmwareVersion || null,
-                        };
-                    }
-
-                    // 3. Persistencia (UPSERT)
-                    // Se ejecuta si es 'position' o 'nodeinfo'
-                    await db.insert(nodes).values({ id: nodeId, ...updateData }).onConflictDoUpdate({
-                        target: nodes.id,
-                        set: {
-                            ...updateData
+                    // Perform the UPSERT operation for the node
+                    // Note: Drizzle's `onConflictDoUpdate` is the equivalent of an UPSERT.
+                    if (Object.keys(updateData).length > 1) { // Check if we have more than just 'id' to update
+                        try {
+                            // You'll need to import `sql` and `eq` from 'drizzle-orm'
+                            await db.insert(nodes)
+                                .values(updateData)
+                                .onConflictDoUpdate({
+                                    target: nodes.id, // Conflict target is the primary key
+                                    set: updateData, // Set the new data on conflict
+                                });
+                            console.log(`Node ${updateData.id} successfully updated/inserted.`);
+                        } catch (dbErr) {
+                            console.error(`DB Error during UPSERT for node ${updateData.id}:`, dbErr);
                         }
-                    });
-
-                    console.log(`[DB SUCCESS] Tipo: ${messageType}, Nodo ${nodeId} (${region}) actualizado.`);
-
+                    }
                 } else {
-                    // Ignorar todos los demás tipos de paquetes (text, telemetry, etc.)
-                    return;
+                    console.log(`[DECODE ERROR] Unhandled Protobuf mapping for portnum: ${portnumString}`);
                 }
+            } else {
+                // This covers non-encrypted packets that don't fit the expected structure 
+                // (e.g., certain internal packets, or if the packet is just a text message with no structured payload)
+                console.log("Packet has no processable 'portnum' and 'payload' or is an unhandled internal type.");
+            }
+
+            // 5. Always update the node's "last seen" metadata
+            const nodeId = packet?.from;
+            if (nodeId) {
+                // TODO: Use the gatewayId, rxTime, rxSnr, rxRssi to update the node status
             }
         } catch (e) {
             console.error(`[PROCESS ERROR] Error al procesar mensaje en ${topic} con el mensaje ${message.toString("utf-8")}:`, e);
@@ -117,6 +164,6 @@ export const getAll = async (): Promise<z.infer<typeof nodes>[]> => {
     try {
         return db.select().from(nodes);
     } catch (err) {
-        throw new ORPCError("BAD_REQUEST", {cause: err})
+        throw new ORPCError("BAD_REQUEST", { cause: err })
     }
 }
